@@ -1,226 +1,154 @@
-import random
-
-import numpy as np
 import torch
-from openpyxl import Workbook
-from openpyxl.styles import Font
-import os
-import itertools
-from scipy.stats import special_ortho_group
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import math
+from torch import Tensor
+from torch.nn import MultiheadAttention
+from einops import rearrange
 
 
-def merge_dataset(data, label):
-    index = np.zeros(data.shape[0], dtype=bool)
-    label_new = []
-    for i in range(label.shape[0]):
-        temp_label = np.unique(label[i])
-        if temp_label.size == 1:
-            index[i] = True
-            label_new.append(label[i, 0])
-    return data[index], np.array(label_new)
+class PositionalEncoding(nn.Module):
+    def __init__(self, hidden_size, max_seq_len=120):
+        super(PositionalEncoding, self).__init__()
+        self.pos_enc = self.positional_encoding(hidden_size, max_seq_len)
+
+    def forward(self, x):
+        x = x + self.pos_enc[:, :x.size(1)].cuda()
+        return x
+
+    def positional_encoding(self, hidden_size, max_seq_len):
+        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, hidden_size, 2).float() * (-math.log(10000.0) / hidden_size))
+        pos_enc = torch.zeros(max_seq_len, hidden_size)
+        pos_enc[:, 0::2] = torch.sin(position * div_term)
+        pos_enc[:, 1::2] = torch.cos(position * div_term)
+        return pos_enc.unsqueeze(0)
 
 
-def select_data(data, labels):
-    user_label_index, position_label_index = 1, 2
-    data = data[labels[:, 0, position_label_index] == 2, ...]
-    labels = labels[labels[:, 0, position_label_index] == 2, ...]
-    return data, labels
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, nhead):
+        super(MultiHeadAttention, self).__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.d_k = d_model // nhead
+
+        self.linear_q = nn.Linear(d_model, d_model)
+        self.linear_k = nn.Linear(d_model, d_model)
+        self.linear_v = nn.Linear(d_model, d_model)
+
+        self.out = nn.Linear(d_model, d_model)
+
+    def forward(self, q, k, v, attn_mask=None):
+        batch_size = q.size(0)
+
+        q = self.linear_q(q).view(batch_size, -1, self.nhead, self.d_k)
+        k = self.linear_k(k).view(batch_size, -1, self.nhead, self.d_k)
+        v = self.linear_v(v).view(batch_size, -1, self.nhead, self.d_k)
+
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask == True, -1e9)
+
+        attention = F.softmax(scores, dim=-1)
+        output = torch.matmul(attention, v)
+
+        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+
+        output = self.out(output)
+
+        return output, attention
 
 
-def split_data_label(data, labels, train_rate, valid_rate):
-    # data, labels = select_data(data, labels)
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1):
+        super(TransformerEncoderLayer, self).__init__()
 
-    label_index = 0
-    arr = np.arange(data.shape[0])
-    np.random.shuffle(arr)
-    data = data[arr]
-    labels = labels[arr]
-    train_num = int(data.shape[0] * train_rate)
-    vali_num = int(data.shape[0] * valid_rate)
-    data_train = data[:train_num, ...]
-    data_vali = data[train_num:train_num + vali_num, ...]
-    data_test = data[train_num + vali_num:, ...]
-    t = np.min(labels[:, :, label_index])
-    label_train = labels[:train_num, ..., label_index] - t
-    label_vali = labels[train_num:train_num + vali_num, ..., label_index] - t
-    label_test = labels[train_num + vali_num:, ..., label_index] - t
+        self.self_attn = MultiheadAttention(embed_dim=d_model, num_heads=nhead, batch_first=True, dropout=dropout)
+        self.linear_q = nn.Linear(d_model, d_model)
+        self.linear_k = nn.Linear(d_model, d_model)
+        self.linear_v = nn.Linear(d_model, d_model)
 
-    data_train, label_train = merge_dataset(data_train, label_train)
-    data_test, label_test = merge_dataset(data_test, label_test)
-    data_vali, label_vali = merge_dataset(data_vali, label_vali)
-    print('Train Size: %d, Vali Size: %d, Test Size: %d' % (
-    label_train.shape[0], label_vali.shape[0], label_test.shape[0]))
-    return data_train, label_train, data_vali, label_vali, data_test, label_test
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
 
+        self.norm1 = nn.LayerNorm(d_model, eps=1e-5)
+        self.norm2 = nn.LayerNorm(d_model, eps=1e-5)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
 
-def split_data_label_tv(data, labels, train_rate=0.5714):
-    label_index = 0
-    arr = np.arange(data.shape[0])
-    np.random.shuffle(arr)
-    data = data[arr]
-    labels = labels[arr]
-    train_num = int(data.shape[0] * train_rate)
+    def forward(self, src, src_mask=None):
 
-    data_train = data[:train_num, ...]
-    data_vali = data[train_num:, ...]
-    t = np.min(labels[:, :, label_index])
-    label_train = labels[:train_num, ..., label_index] - t
-    label_vali = labels[train_num:, ..., label_index] - t
+        src2, attn_map = self.self_attn(src, src, src, attn_mask=src_mask)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
 
-    data_train, label_train = merge_dataset(data_train, label_train)
-    data_vali, label_vali = merge_dataset(data_vali, label_vali)
-    print('Train Size: %d, Vali Size: %d' % (label_train.shape[0], label_vali.shape[0]))
-    return data_train, label_train, data_vali, label_vali
+        src2 = self.linear2(self.dropout(F.relu(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src, attn_map
 
 
-def down_sampling(data, original_sampling_rate, aim_sampling_rate):
-    step = int(original_sampling_rate / aim_sampling_rate)
-    result_data = data[:, ::step, :]
-    return result_data
+class TimeSeriesTransformer(nn.Module):
+    def __init__(self, channel_size, d_model, nhead, num_layers, dim_feedforward, seq_length, output_size, is_trans_pt,
+                 is_mask, filter_pos):
+        super(TimeSeriesTransformer, self).__init__()
+        self.is_trans_pt = is_trans_pt
+        self.channel_size = channel_size
+        self.is_mask = is_mask
+        self.filter_pos = filter_pos
 
+        self.embedding = nn.Linear(int(seq_length / 2), d_model)
 
-class WriteExcel:
-    def __init__(self, excel_name):
-        self.excel_name = excel_name
-        self.letter_list = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O']
-        self.dataset_list = ['uci', 'shoaib', 'motion', 'hhar']
-        self.init_excel()
+        self.layers = nn.ModuleList(
+            [TransformerEncoderLayer(d_model, nhead, dim_feedforward) for _ in range(num_layers)])
 
-    def init_excel(self):
-        self.wb = Workbook()
-        self.ws = self.wb.active
+        self.bn = nn.BatchNorm1d(num_features=channel_size)
+        self.fc = nn.Linear(d_model, output_size)
 
-        self.ws.merge_cells('A1:A2')
-        for i, column in enumerate(range(1, 13, 3)):
-            self.ws.merge_cells(self.letter_list[column] + '1:' + self.letter_list[column + 2] + '1')
-            self.ws[self.letter_list[column] + '1'] = self.dataset_list[i]
-            self.ws[self.letter_list[column] + '2'] = 'cm'
-            self.ws[self.letter_list[column + 1] + '2'] = 'acc'
-            self.ws[self.letter_list[column + 2] + '2'] = 'f1'
-        self.ws.merge_cells('N1:O1')
-        self.ws['N1'] = 'avg'
-        self.ws['N2'] = 'acc'
-        self.ws['O2'] = 'f1'
-        self.ws['A7'] = 'avg_all'
-        for i in range(len(self.dataset_list)):
-            self.ws['A' + str(i + 3)] = self.dataset_list[i]
+    def forward(self, x):
+        x = torch.fft.rfft(x, dim=2)
+        x = x[:, :, 1:]
 
-    def write_excel(self, source_dataset, target_dataset, cm, acc, f1):
-        row_index = self.dataset_list.index(source_dataset) + 3
-        column_index = self.dataset_list.index(target_dataset) * 3 + 1
-        font = Font(size=7)
-        self.ws[self.letter_list[column_index] + str(row_index)] = self.deal_cm(cm.replace(' ', ','))
-        self.ws[self.letter_list[column_index] + str(row_index)].font = font
-        self.ws[self.letter_list[column_index + 1] + str(row_index)] = str(round(acc * 100, 2)) + "%"
-        self.ws[self.letter_list[column_index + 2] + str(row_index)] = str(round(f1 * 100, 2)) + "%"
+        amplitude = torch.abs(x)
 
-    def write_excel_avg(self, dataset, acc, f1):
-        if dataset in self.dataset_list:
-            row_index = self.dataset_list.index(dataset) + 3
+        fundamental_freq_index = torch.argmax(amplitude, axis=2)
+        if self.is_trans_pt:
+            Cut_off_frequency = fundamental_freq_index + (
+                        self.filter_pos * (x.size(2) * torch.ones((x.size(0), x.size(1)))
+                                           - fundamental_freq_index) / 4).int()
         else:
-            row_index = 7  # write avg_all
-        acc_column, f1_column = 'N', 'O'
-        self.ws[acc_column + str(row_index)] = str(round(acc * 100, 2)) + "%"
-        self.ws[f1_column + str(row_index)] = str(round(f1 * 100, 2)) + "%"
+            Cut_off_frequency = fundamental_freq_index + (
+                        self.filter_pos * (x.size(2) * torch.ones((x.size(0), x.size(1))).cuda()
+                                           - fundamental_freq_index) / 4).int()
 
-    def deal_cm(self, cm):
-        stage = 1
-        result = ""
-        for i in range(len(cm)):
-            if cm[i] != ',':
-                result += cm[i]
-                if stage == 1:
-                    stage = 0
+        for i in range(Cut_off_frequency.size(0)):
+            for j in range(Cut_off_frequency.size(1)):
+                amplitude[i, j, Cut_off_frequency[i, j] + 1:] = 0
+
+        x = self.embedding(amplitude)
+        x = torch.relu(self.bn(x))
+
+        if self.is_trans_pt:
+            src_mask = torch.zeros(self.channel_size, self.channel_size).type(torch.bool)
+        else:
+            src_mask = torch.zeros(self.channel_size, self.channel_size).type(torch.bool).cuda()
+        mask_pos = [[0, 4], [0, 5], [1, 3], [1, 5], [2, 3], [2, 4], [3, 1], [3, 2], [4, 0], [4, 2], [5, 0], [5, 1]]
+        for i in range(len(mask_pos)):
+            src_mask[mask_pos[i][0], mask_pos[i][1]] = True
+
+        for layer in self.layers:
+            if self.is_mask:
+                x, _ = layer(x, src_mask=src_mask)
             else:
-                if stage == 1:
-                    result += " "
-                elif cm[i - 1] == '\n' or cm[i - 1] == '[':
-                    pass
-                else:
-                    result += ","
-                    stage = 1
-        return result
+                x, _ = layer(x)
 
-    def save_excel(self, save_path):
-        self.wb.save(os.path.join(save_path, self.excel_name))
+        x = torch.mean(x, dim=1)
+        x = self.fc(x)
+        return x
 
-
-def augument_dataset(data, label, method='channel_aug'):
-    # data(sample num, sequence_len, feature), label(sample num, sequence_len, feature)
-    print(f'begin data augmentation: method is {method}')
-    data_res = np.empty((0, data.shape[1], data.shape[2]))
-    label_res = np.empty((0, label.shape[1], label.shape[2]))
-    aug_num = 5  # aug_num: the number of sample of one sample will augument
-
-    if method == '':
-        data_res = np.concatenate([data_res, data], axis=0)
-        label_res = np.concatenate([label_res, label], axis=0)
-        return data_res, label_res
-
-    elif method == 'rotation_random':
-        axis_num = 3
-
-        # each sample rotation matrix is same
-        for i in range(aug_num):
-            axis = np.random.uniform(low=-1, high=1, size=axis_num)
-            angle = np.random.uniform(low=-np.pi, high=np.pi)
-            rotation_mat = special_ortho_group.rvs(3)
-            data_temp = data.reshape(-1, 6)
-            aug_temp_acc = np.matmul(data_temp[:, :3], rotation_mat)
-            aug_temp_gyr = np.matmul(data_temp[:, 3:], rotation_mat)
-            aug_temp = np.concatenate([aug_temp_acc, aug_temp_gyr], axis=1)
-            aug_temp = aug_temp.reshape(-1, 120, 6)
-            data_res = np.concatenate([data_res, aug_temp], axis=0)
-            label_res = np.concatenate([label_res, label], axis=0)
-        data_res = np.concatenate([data_res, data], axis=0)
-        label_res = np.concatenate([label_res, label], axis=0)
-
-    else:
-        print('method not exist')
-        return None, None
-
-    print(f'data augumentation end')
-    return data_res, label_res
-
-
-def make_one_shot_dataset(data, label, activity_label_index=0):
-    _, index = np.unique(label, return_index=True)
-    res_data, res_label = data[index], label[index]
-    return res_data, res_label
-
-
-def change_windowsize(data, label, window_size):
-    # data (num, windowsize, feature) label (num, window_size, label_num)
-
-    if data.shape[1] == window_size:
-        return data, label
-
-    print(f'change window_size from {data.shape[1]} to {window_size}')
-    label_num = label.shape[2]
-    label_unique_list = []
-    for i in range(label_num):
-        unique_value, count = np.unique(label[:, 0, i], return_counts=True)
-        label_unique_list.append(unique_value.tolist())
-
-    res_data = np.empty(shape=(0, window_size, data.shape[2]))
-    res_label = np.empty(shape=(0, window_size, label_num))
-    label_combines = list(itertools.product(*label_unique_list))
-    for label_combine in label_combines:
-        label_combine = np.array(label_combine)
-        data_temp = data[(label[:, 0, :] == label_combine).all(axis=1)]
-
-        data_temp = data_temp.reshape(-1, data.shape[2])
-        redundancy = data_temp.shape[0] % window_size
-        data_temp = data_temp[:-redundancy, :]
-        data_temp = data_temp.reshape(-1, window_size, data.shape[2])
-
-        label_temp = np.zeros(shape=(data_temp.shape[0], data_temp.shape[1], label_num))
-        for i in range(len(label_combine)):
-            label_temp[:, :, i] = label_combine[i]
-        res_data = np.concatenate([res_data, data_temp], axis=0)
-        res_label = np.concatenate([res_label, label_temp], axis=0)
-
-    print(f'data shape after change window_size{res_data.shape}')
-    print(f'label shape after change window_size{res_label.shape}')
-
-    return res_data, res_label
